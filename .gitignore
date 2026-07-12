@@ -1,0 +1,4 @@
+# ember and forge are independent git repos, not subdirectories of this one
+ember/
+forge/
+.DS_Store
