@@ -175,9 +175,83 @@ If a week produced no movement on either number, that week stalled — and you'l
 
 ---
 
+# STAGE C — `ember/dist`: distributed training & the network it runs on
+
+The loop closes on one GPU. This stage is about what happens when it can't — collectives, interconnects, parallelism schemes, fault tolerance — and it's the stage aimed straight at the systems interest. Everything ships inside `ember` as `ember/dist/`, built the same way as everything else: your implementation, parity-gated against the library version, with a number that can't be gamed. By the end, the Convergence stretch goal (pretraining your own >1B base for B4) stops being rhetorical, because a >1B pretrain *is* a distributed pretrain. EECS 491 gave you the vocabulary; here every abstraction has to earn its keep against a wire with measured bandwidth.
+
+Two honesty clauses, decided now:
+
+1. **Correctness is measured locally; performance is measured on rented matched hardware.** The 2080S + 4070 pair is heterogeneous (Turing vs Ada, 8GB vs 12GB) — any job across them runs at the slow rank's pace, which makes it a fine correctness rig and a deliberately bad performance rig. Scoreboard perf numbers come only from rented matched GPUs (2×4090 spot ≈ $0.60–0.90/hr for C1–C3; 2-node instances for C4–C5). If the two cards live in separate boxes on your LAN, that's not a limitation — it's the C4 lab. A real network with real (miserable) bandwidth is the best teacher 1GbE will ever be.
+2. **You will not beat NCCL or PyTorch DDP, and the metrics don't ask you to.** Every gate here is either a *parity gate* (match the library's numerics exactly; reach ≥90% of its throughput) or a *prediction gate* (write down what the performance model says *before* measuring; the metric is prediction error). Prediction error is this stage's un-gameable number, the way anti-cheat was B0's.
+
+Standing rule: every milestone has a **2-process degenerate mode** (two ranks on one GPU, or gloo on CPU) so correctness never waits on hardware — and every distributed bug gets reproduced at the smallest world size that shows it before anything rented is touched. Pre-committed now, because the alternative is debugging NCCL hangs at $6/hr.
+
+**Third permanent scoreboard:** `ember/dist/SCOREBOARD.md` — prediction error (%) per milestone, and MFU + tokens/sec/GPU at the C5 capstone config. Joins the Monday review with the other two.
+
+## C0 — Collectives from scratch (the network is a device; learn it like one)
+**Goal:** implement the core collectives yourself on point-to-point primitives, and build the comm benchmark the whole stage stands on.
+**Ship:** `ember/dist/collectives.py` — ring all-reduce, all-gather, reduce-scatter, broadcast — built **twice**: first over raw TCP sockets (no torch, so nothing is hidden), then over `torch.distributed` P2P (gloo/NCCL). Plus `bin/ember bench-comm`: bandwidth/latency curves vs message size for every link you can touch (loopback, PCIe, LAN, rented NVLink), and a fitted **α–β cost model** (latency + bytes/bandwidth) per link.
+**Metric:** (1) your all-reduce matches NCCL's output to written tolerance on randomized tensors across world sizes; (2) the ring hits ≥60% of measured link bandwidth at large message sizes; (3) the α–β fit predicts measured time within 15% across ≥3 orders of magnitude of message size. Report algbw vs busbw the way nccl-tests does — knowing the difference is part of the milestone.
+**Forced learning:** ring vs tree algorithms, why all-reduce = reduce-scatter + all-gather, the latency regime vs the bandwidth regime, what NCCL actually is (transports, channels, protocols).
+**Learn:** *Prime:* the Ultra-Scale Playbook's communication section + the classic Baidu ring-allreduce post. *Consult:* nccl-tests source for benchmark methodology. *Deepen:* NCCL docs on transports/protocols; "Demystifying NCCL" (2025).
+**Trap:** benchmarking in the latency regime and calling it bandwidth. Small messages measure α, large ones measure β; the fit is only honest if the sweep covers both.
+**Time:** ~3 weeks.
+
+## C1 — DDP from scratch
+**Goal:** your own data-parallel engine — semantically identical to single-GPU training, within 10% of PyTorch DDP's throughput.
+**Ship:** `ember/dist/ddp.py` — autograd-hook-driven gradient sync with bucketing, comm/compute overlap, `no_sync`-style gradient accumulation, per-rank data sharding and seeding — wired into `ember/train.py` behind a flag.
+**Metric:** (gate first, before any perf work) a 2-rank run's loss curve is statistically identical to a single-process run at the same effective batch — seeds fixed, tolerance written down in advance. Then: ≥90% of `DistributedDataParallel` throughput on rented matched 2×GPU, and an Nsight Systems trace showing all-reduce hidden under backward. The trace writeup is a deliverable, like B1's.
+**Forced learning:** when autograd hooks fire, why DDP buckets gradients (~25MB) instead of syncing per-tensor, overlap scheduling, loss averaging vs summing, the uneven-last-batch problem.
+**Learn:** *Consult:* the PyTorch DDP design note; picotron's `data_parallel.py` — diff against it only after yours runs, nanoGPT rules. *Deepen:* Li 2020 (the PyTorch DDP paper, VLDB — read after your version works; it's a catalog of everything you just hit).
+**Trap:** "matches roughly" hiding a real bug — seed/shard/dropout mistakes look like noise for a thousand steps. The equivalence gate exists so *close* is never mistaken for *correct*.
+**Time:** ~3 weeks.
+
+## C2 — ZeRO from scratch (memory is the real currency)
+**Goal:** shard optimizer state and gradients (ZeRO-1/2) with a written memory model the hardware confirms; ZeRO-3 (param sharding) as stretch.
+**Ship:** `ember/dist/zero.py`, plus a memory-accounting note — predicted bytes/param for params, grads, optimizer state, and mixed-precision master copies at each ZeRO stage — **written before implementing**.
+**Metric:** (1) predicted peak VRAM within 10% of `torch.cuda.max_memory_allocated` across configs; (2) ZeRO-2 trains a config that demonstrably OOMs under your C1 DDP on the same GPU; (3) loss parity with DDP (same gate as C1).
+**Forced learning:** where training memory actually goes, reduce-scatter-based gradient sharding, per-stage communication volume vs plain DDP, why ZeRO-3 pays an extra all-gather every step.
+**Learn:** *Prime:* Ultra-Scale Playbook ZeRO chapter. *Deepen:* Rajbhandari 2020 (ZeRO); Zhao 2023 (PyTorch FSDP).
+**Trap:** measuring memory with `nvidia-smi` — the caching allocator makes it lie. Use torch's allocator stats, and account for master weights explicitly or the model double-counts.
+**Time:** ~3 weeks.
+
+## C3 — Tensor & pipeline parallelism
+**Goal:** Megatron-style TP for the MLP and attention blocks, and pipeline parallelism with a 1F1B schedule — both proven equivalent to the single-GPU model.
+**Ship:** `ember/dist/tp.py` (column/row-parallel linears; the two-all-reduce transformer block), `ember/dist/pipeline.py` (microbatching; GPipe schedule first, then 1F1B).
+**Metric:** (1) TP=2 matches single-GPU outputs to numerical tolerance — TP is a refactor of the same math and must *match*, not approximate; (2) measured pipeline bubble fraction within a few points of the (p−1)/(m+p−1) prediction across ≥3 microbatch counts; (3) a comm-volume table — bytes per layer per step for DP vs TP vs PP — validated against traced traffic.
+**Forced learning:** which matmuls split column-wise vs row-wise and why the block needs exactly two all-reduces, microbatching and activation memory vs bubble tradeoffs, why TP dies on slow links while PP tolerates them.
+**Learn:** *Prime:* Ultra-Scale Playbook TP + PP chapters. *Consult:* picotron's `tensor_parallel.py`/`pipeline_parallel.py`, same diff-after rule. *Deepen:* Shoeybi 2019 (Megatron-LM); Huang 2019 (GPipe); Narayanan 2021 (the 1F1B analysis).
+**Hardware:** rented matched 2–4×GPU for perf; the 2-process degenerate mode for all correctness work.
+**Trap:** testing only dimensions that divide evenly by the parallel degree — B1's power-of-2 disease wearing a new coat. Odd head counts and vocab remainders go in the gate.
+**Time:** ~4 weeks.
+
+## C4 — Multi-node: the actual network
+**Goal:** run your stack across physically separate machines, and predict its throughput from the C0 model *before* measuring it.
+**Ship:** `bin/ember launch` (rendezvous, env plumbing, the NCCL debug knobs you'll need); an MFU calculator; and the **bandwidth-ladder writeup** — measured α/β for every rung you can touch: intra-box PCIe, your LAN, rented NVLink, rented inter-node fabric (IB/RoCE vs plain TCP).
+**Metric:** a pre-registered prediction: tokens/sec for a 2-node DDP+ZeRO run, written down before launch, measured within 20%. Then find one real bottleneck in the trace (bucket size vs link latency, stragglers, host networking) and fix it — before/after numbers or it didn't happen.
+**Forced learning:** TCP vs RDMA data paths, GPUDirect, what `NCCL_DEBUG`/`NCCL_SOCKET_IFNAME` actually reveal, rendezvous and launchers, why gradient compression research exists.
+**Learn:** *Consult:* Stas Bekman's ML Engineering book (networking chapters) — field notes for exactly this. *Deepen:* an RDMA/verbs primer; re-read "Demystifying NCCL" now that you've been burned by it.
+**Trap:** if the local lab is two boxes on gigabit Ethernet, the numbers will be terrible — that's the curriculum, not a failure. The win is the model predicting *exactly how* terrible. Rent IB-connected nodes to see the other end of the ladder; don't try to tune your way past physics.
+**Time:** ~3 weeks.
+
+## C5 — Fault tolerance + the capstone run
+**Goal:** training that survives death, then the stage capstone: a pre-registered multi-node run hitting an MFU target with your stack end to end.
+**Ship:** sharded checkpointing with kill-tested resume; restart-without-babysitting (a rank dies → the job resumes from the last checkpoint on its own); the capstone run report.
+**Metric:** (1) `kill -9` a rank at a randomly chosen step: the run resumes automatically and final loss matches an uninterrupted control within written tolerance; (2) **capstone:** a rented 2-node run training a ~350M–1B `ember` config with your DDP+ZeRO hybrid, hitting an MFU target you pick and justify beforehand from your roofline + α–β model (~35–40% is the honest neighborhood for that setup). Pre-registration *is* the metric — hitting a number you predicted is the whole stage in one run.
+**Forced learning:** MFU math from first principles, checkpoint sharding, failure modes at scale, why elastic training is genuinely hard.
+**Learn:** *Consult:* torchrun-elastic and torchft design docs. *Deepen:* the capstone report you write — this milestone's Deepen is your own postmortem.
+**Trap:** "it resumed" without proving equivalence. A resume that silently skips or replays a data shard passes the eye test and corrupts the run; the control-run comparison is the gate.
+**Time:** ~3 weeks.
+
+**What C unlocks:** with C0–C5 shipped, the Convergence stretch — scaling `ember` past 1B and swapping your own pretrained weights into B4 — is an engineering exercise instead of a wish. That's the version of the loop where even the pretraining is yours, running on a parallelism stack that is also yours.
+
+---
+
 # Sequencing & timeline
 
-`A0 → A1 → B0 → B1 → A2 (GPT-2) → B2 → A3 → B3 → B4 → close the loop → improve forever.`
+`A0 → A1 → B0 → B1 → A2 (GPT-2) → B2 → A3 → B3 → B4 → close the loop → C0 → C1 → C2 → C3 → C4 → C5 → improve forever.`
+
+Stage C is last on purpose: it needs a working `ember` to parallelize, and by then A2 has already made you a *user* of torchrun/DDP — C is where you take the lid off. If the systems itch gets unbearable earlier, C0 (collectives + the comm benchmark) is self-contained and can slot in any time after A2 without disturbing the rest.
 
 Interleaving A and B is deliberate: B0/B1 slot in after A1 so you're not doing pure-model or pure-kernel work for months on end. (Note the A2 run does *not* wait for your kernels — it uses stock SDPA/`torch.compile`; your FlashAttention lands later, in B2, and proves itself on the 4070.)
 
@@ -195,8 +269,14 @@ At ~10 focused hrs/week:
 | B3 — agentic generation | 5 | month 7.5 |
 | B4 — close the loop | 4 | month 8.5 |
 | Convergence wiring | 2 | month 9 |
+| C0 — collectives + comm bench | 3 | month 9.75 |
+| C1 — DDP from scratch | 3 | month 10.5 |
+| C2 — ZeRO | 3 | month 11.25 |
+| C3 — TP + PP | 4 | month 12.25 |
+| C4 — multi-node *(wall #3)* | 3 | month 13 |
+| C5 — fault tolerance + capstone | 3 | month 13.75 |
 
-**~35–37 weeks ≈ 9 months nominal, 12 with life happening.** If your real cadence is 5 hrs/week, it's an 18-month plan — decide that consciously rather than discovering it in month 6.
+**~54–56 weeks ≈ 13–14 months nominal, 17–18 with life happening.** If your real cadence is 5 hrs/week, it's a two-year plan — decide that consciously rather than discovering it in month 6.
 
 ---
 
@@ -210,10 +290,11 @@ The education hides inside the metrics — but only if you protect the *struggle
 4. **Deepen** (after the metric is hit): read the listed papers properly. They land completely differently once you've built the thing — that's why they come last.
 5. **Write it down:** each milestone ends with a build-log entry explaining what the metric took. The Nsight writeups in B1 and the experiment reports in A4 *are* the retention mechanism — no flashcards needed. Explaining the win is how you keep it.
 
-**Reading map** (paced with milestones, not front-loaded):
+**Reading map** (paced with milestones, not front-loaded — every item below is linked, with its Prime/Consult/Deepen slot, in [LEARNING.md](LEARNING.md)):
 - PMPP ch. 1–6 alongside B0/B1; ch. 10 (reduction) at softmax/layernorm; later chapters on demand.
-- GPU MODE lectures 1–3 → B0; 4–9 → B1/B2.
-- Papers are always Deepen-phase: Vaswani (A0), Sennrich (A1), GPT-2/Chinchilla (A2), InstructGPT/DPO/LoRA/QLoRA (A3), FlashAttention (B2), CUDA-LLM/Kevin/KernelLLM (B3/B4).
+- GPU MODE lectures 1–3 → B0; 4–9 → B1/B2; the NCCL/distributed lectures → C0/C1.
+- The Ultra-Scale Playbook (HuggingFace) is Stage C's spine — one chapter primed per milestone (comms → C0, DP → C1, ZeRO → C2, TP/PP → C3), never read ahead of the build. "How to Scale Your Model" (the DeepMind scaling book) for the roofline/comm mental math; Bekman's ML Engineering networking chapters at C4.
+- Papers are always Deepen-phase: Vaswani (A0), Sennrich (A1), GPT-2/Chinchilla (A2), InstructGPT/DPO/LoRA/QLoRA (A3), FlashAttention (B2), CUDA-LLM/Kevin/KernelLLM (B3/B4), PyTorch DDP (C1), ZeRO/FSDP (C2), Megatron/GPipe/1F1B (C3), Demystifying NCCL (C0/C4).
 
 **Lab notebook:** a running `NOTES.md` per library — hypotheses, dead ends, numbers. Cheap to write, priceless in month 6.
 
@@ -228,9 +309,10 @@ The education hides inside the metrics — but only if you protect the *struggle
 
 **Stall rule:** if a scoreboard number hasn't moved in 2 weeks, shrink the current task until something ships in one session. Momentum beats scope.
 
-**The two walls — responses pre-committed now:**
+**The three walls — responses pre-committed now:**
 - **B1 (kernels fight back):** a kernel that resists for a week gets demoted to a simpler op. Slow-but-correct is progress; profile before optimizing; the Nsight writeup of *why* it's slow counts as shipping.
 - **A2 (the big run is finicky):** never debug on the 8× node. Every failure reproduces on the 2080S or a $3 single-GPU dry run first. The pre-flight checklist exists precisely for the moment you're tempted to skip it.
+- **C4 (multi-node hangs give you no stack trace, just a bill):** every distributed bug reproduces at the smallest world size that shows it — 2 processes on one box, gloo on CPU if it still reproduces there — before anything rented is touched. `NCCL_DEBUG=INFO` from the first run, not after the first hang.
 
 **Paused vs abandoned:** pausing is writing a dated note in the build log saying what's next and when you'll return. Anything else is abandoning. Make the state explicit.
 
@@ -243,10 +325,12 @@ The education hides inside the metrics — but only if you protect the *struggle
 | A2: 2–3 attempts on rented 8×H100 + dry runs | $150–300 |
 | B3: API spend over ~2 active months (capped) | $200–300 |
 | A3/B4 finetunes: local 4070 (LoRA/QLoRA), occasional cloud top-up | $0–100 |
+| C1–C3: rented matched 2×4090 spot, dev + perf hours | $50–100 |
+| C4–C5: rented 2-node time (incl. IB nodes + the capstone run) | $100–200 |
 | Misc (storage, dataset hosting, dry runs) | $50 |
-| **Total** | **≈ $400–750** |
+| **Total** | **≈ $550–1050** |
 
-**Hardware roles:** 2080S (Turing, 8GB) = correctness dev + tiny overfits. 4070 (Ada, 12GB) = kernel dev, autotuning, finetunes, the A4 experiment loop — the machine the flywheel actually spins on. Rented 8×H100 = A2 only.
+**Hardware roles:** 2080S (Turing, 8GB) = correctness dev + tiny overfits. 4070 (Ada, 12GB) = kernel dev, autotuning, finetunes, the A4 experiment loop — the machine the flywheel actually spins on. Rented 8×H100 = A2 only. Stage C: the local pair = distributed *correctness* rig (heterogeneous — never quote perf from it) and, if the cards live in separate boxes, the C4 home-LAN networking lab; rented matched 2×4090 = C1–C3 perf rig; rented 2-node = C4/C5.
 
 ---
 
@@ -258,4 +342,4 @@ The education hides inside the metrics — but only if you protect the *struggle
 
 ---
 
-**Honest note:** this is a large, multi-quarter build on top of everything else you're carrying. The failure mode is not slowness — it's abandoning at B1 (kernels fight back) or A2 (the first real training run is finicky). Those are the two walls, and the pre-committed responses above are the ladder over them. Ship A2 (a GPT-2 you trained) and B1 (six hand-written kernels that beat eager, honestly benchmarked against `torch.compile`) and you already have two things almost nobody who "studies ML" ever produces. Everything after is the fun part: making them build each other.
+**Honest note:** this is a large, multi-quarter build on top of everything else you're carrying. The failure mode is not slowness — it's abandoning at B1 (kernels fight back) or A2 (the first real training run is finicky). Those are the two walls, and the pre-committed responses above are the ladder over them. Ship A2 (a GPT-2 you trained) and B1 (six hand-written kernels that beat eager, honestly benchmarked against `torch.compile`) and you already have two things almost nobody who "studies ML" ever produces. Everything after is the fun part: making them build each other — and Stage C is the part pointed at where your interest actually lives, the systems underneath the training run. When the middle of the plan drags, that's the stage you're walking toward.
