@@ -77,7 +77,7 @@ The loop never "finishes" — it's the thing you improve indefinitely. Everythin
 **Goal:** build the finetuning stack, and prove it where the signal is measurable.
 **Ship:** `ember/finetune.py` supporting full-FT, LoRA, and DPO (DPO before GRPO: offline, no reward model, no rollout infra — GRPO belongs to the kernel-RL stretch after B4). Proven on **two tracks**:
 - *Track 1 — ember-124M:* SFT your own base model. Expect a small, largely qualitative lift — a 124M model is below the scale where DPO deltas separate from noise. Document honestly; this track is about the code path working on your lineage.
-- *Track 2 — a small open-weights model (1–2B, Llama-3.2-1B / Qwen-class):* where instruction lift is real and measurable. LoRA fits on the 4070 (12GB); QLoRA if you go bigger. This track is also deliberate practice for B4, which uses the same machinery.
+- *Track 2 — a small open-weights model (1–2B, Llama-3.2-1B / Qwen-class):* where instruction lift is real and measurable. LoRA on a 1B fits on the 4070 (8GB laptop card); QLoRA beyond that. The full-FT row of the comparison table can't fit a 1–2B in 8GB (~16 bytes/param with AdamW) — do that row on a ~0.5B model with an 8-bit optimizer + activation checkpointing. This track is also deliberate practice for B4, which uses the same machinery.
 **Metric:** on Track 2, with a **pre-registered judge** (fixed judge model, fixed prompt, frozen 100-prompt eval set, position-swapped pairs): finetuned wins ≥65% vs its own base. Plus a LoRA-vs-full table (params, VRAM, wall-clock, win-rate) and a base-capability eval before/after — the alignment-tax check is mandatory, not optional.
 **Forced learning:** SFT, RLHF vs DPO vs GRPO, LoRA/QLoRA mechanics and their tradeoffs, judge-eval design and its failure modes.
 **Learn:** *Deepen:* Ouyang 2022 (InstructGPT); Rafailov 2023 (DPO); Hu 2021 (LoRA); Dettmers 2023 (QLoRA). *Consult:* `karpathy/nanochat` as the full-lifecycle reference.
@@ -145,7 +145,7 @@ The order matters: you can't generate good kernels until you've built the harnes
 
 ## B4 — Close the loop: your stack trains the kernel generator
 **Goal:** finetune a small model with *your* `ember` stack to generate kernels, and have it drive `forge`.
-**Framing (decided in the north-star section):** the base is a small open-weights **code** model (Qwen-Coder-class, 1.5–8B) — not your from-scratch 124M, which cannot write compiling kernels. What makes it "yours": your `ember/finetune.py`, your harvested dataset, your evals. A from-scratch-weights generator is the post-plan stretch.
+**Framing (decided in the north-star section):** the base is a small open-weights **code** model (Qwen-Coder-class, 1.5–8B; on the 8GB 4070 that means QLoRA, comfortable at 1.5–3B — the 7–8B end is where the budgeted cloud top-up goes) — not your from-scratch 124M, which cannot write compiling kernels. What makes it "yours": your `ember/finetune.py`, your harvested dataset, your evals. A from-scratch-weights generator is the post-plan stretch.
 **Ship:**
 - A kernel dataset harvested from B3 traces: **only kernels that pass B0 on fresh inputs enter**; dedup near-identical solutions; rejection-sample to top-k by speedup per task.
 - An SFT run (optional: DPO on fast-vs-slow kernel pairs) via `ember/finetune.py`, on the 4070 (LoRA/QLoRA).
@@ -181,7 +181,7 @@ The loop closes on one GPU. This stage is about what happens when it can't — c
 
 Two honesty clauses, decided now:
 
-1. **Correctness is measured locally; performance is measured on rented matched hardware.** The 2080S + 4070 pair is heterogeneous (Turing vs Ada, 8GB vs 12GB) — any job across them runs at the slow rank's pace, which makes it a fine correctness rig and a deliberately bad performance rig. Scoreboard perf numbers come only from rented matched GPUs (2×4090 spot ≈ $0.60–0.90/hr for C1–C3; 2-node instances for C4–C5). If the two cards live in separate boxes on your LAN, that's not a limitation — it's the C4 lab. A real network with real (miserable) bandwidth is the best teacher 1GbE will ever be.
+1. **Correctness is measured locally; performance is measured on rented matched hardware.** The 2080S + 4070 pair is heterogeneous (Turing vs Ada; both 8GB) — any job across them runs at the slow rank's pace, which makes it a fine correctness rig and a deliberately bad performance rig. Scoreboard perf numbers come only from rented matched GPUs (2×4090 spot ≈ $0.60–0.90/hr for C1–C3; 2-node instances for C4–C5). If the two cards live in separate boxes on your LAN, that's not a limitation — it's the C4 lab. A real network with real (miserable) bandwidth is the best teacher 1GbE will ever be.
 2. **You will not beat NCCL or PyTorch DDP, and the metrics don't ask you to.** Every gate here is either a *parity gate* (match the library's numerics exactly; reach ≥90% of its throughput) or a *prediction gate* (write down what the performance model says *before* measuring; the metric is prediction error). Prediction error is this stage's un-gameable number, the way anti-cheat was B0's.
 
 Standing rule: every milestone has a **2-process degenerate mode** (two ranks on one GPU, or gloo on CPU) so correctness never waits on hardware — and every distributed bug gets reproduced at the smallest world size that shows it before anything rented is touched. Pre-committed now, because the alternative is debugging NCCL hangs at $6/hr.
@@ -330,7 +330,7 @@ The education hides inside the metrics — but only if you protect the *struggle
 | Misc (storage, dataset hosting, dry runs) | $50 |
 | **Total** | **≈ $550–1050** |
 
-**Hardware roles:** 2080S (Turing, 8GB) = correctness dev + tiny overfits. 4070 (Ada, 12GB) = kernel dev, autotuning, finetunes, the A4 experiment loop — the machine the flywheel actually spins on. Rented 8×H100 = A2 only. Stage C: the local pair = distributed *correctness* rig (heterogeneous — never quote perf from it) and, if the cards live in separate boxes, the C4 home-LAN networking lab; rented matched 2×4090 = C1–C3 perf rig; rented 2-node = C4/C5.
+**Hardware roles:** 2080S (Turing, 8GB) = correctness dev + tiny overfits. 4070 laptop (Ada, 8GB) = kernel dev, autotuning, finetunes, the A4 experiment loop — the machine the flywheel actually spins on. Laptop caveat: GPU clocks drift with thermals and usually can't be locked — pin the power profile and log clock speed during any benchmark run, or the timing numbers are noise. Rented 8×H100 = A2 only. Stage C: the local pair = distributed *correctness* rig (heterogeneous — never quote perf from it) and, if the cards live in separate boxes, the C4 home-LAN networking lab; rented matched 2×4090 = C1–C3 perf rig; rented 2-node = C4/C5.
 
 ---
 
